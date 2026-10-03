@@ -12,16 +12,23 @@ function(add_quiz target path)
 
     target_include_directories(${target} PRIVATE include)
 
-    target_compile_options(${target} PRIVATE
-        -Wall
-        -Wextra
-        -Wpedantic
-        -Werror
-        -Wshadow
-        -Wconversion
-        -Wsign-conversion
-        -Wnull-dereference
-    )
+    if(MSVC)
+        target_compile_options(${target} PRIVATE
+            /W4
+            /WX
+        )
+    else()
+        target_compile_options(${target} PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+            -Werror
+            -Wshadow
+            -Wconversion
+            -Wsign-conversion
+            -Wnull-dereference
+        )
+    endif()
 
 endfunction()
 
