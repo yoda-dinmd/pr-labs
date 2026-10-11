@@ -1,347 +1,407 @@
-#include <iostream>
-#include <fstream>
-#include <random>
+#include <charconv>
 #include <chrono>
-#include <string>
-#include <vector>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <queue>
 #include <condition_variable>
-#include <sstream>
-#include <optional>
-#include <functional>
-#include <iosfwd>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <queue>
+#include <random>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <windows.h>
 #include <psapi.h>
-#pragma comment(lib, "psapi.lib")
+#else
+#include <sys/resource.h>
 #endif
 
+using Clock = std::chrono::steady_clock;
+constexpr long long NUMBER_COUNT = 50'000'000;
+constexpr std::size_t FILE_COUNT = 8;
+constexpr std::size_t BATCH_SIZE = 10'000;
+constexpr std::size_t QUEUE_LIMIT = 100;
+
+struct Counts {
+    long long negative = 0, zero = 0, positive = 0;
+
+    void count(int value) {
+        if (value < 0) ++negative;
+        else if (value == 0) ++zero;
+        else ++positive;
+    }
+    void add(const Counts& other) {
+        negative += other.negative;
+        zero += other.zero;
+        positive += other.positive;
+    }
+    long long total() const { return negative + zero + positive; }
+};
+
+// Fail immediately: this lab assumes valid generated input and does not recover from errors.
+[[noreturn]] void fail(const std::string& message) {
+    std::cerr << "Error: " << message << '\n';
+    std::exit(1);
+}
+
+std::ifstream open_input(const std::filesystem::path& path, std::ios::openmode mode = {}) {
+    std::ifstream input(path, std::ios::binary | mode);
+    if (!input) fail("Cannot open " + path.string());
+    return input;
+}
+
+int parse(std::string_view line) {
+    int value = 0;
+    if (std::from_chars(line.data(), line.data() + line.size(), value).ec != std::errc{})
+        fail("Invalid integer in input");
+    return value;
+}
+
+Counts combine(const std::vector<Counts>& partial) {
+    Counts result;
+    for (const auto& counts : partial) result.add(counts);
+    return result;
+}
+
+void print_counts(const Counts& counts) {
+    std::cout << "Negative: " << counts.negative << " Zero: " << counts.zero
+              << " Positive: " << counts.positive << " Total: " << counts.total() << '\n';
+}
 
 void print_memory() {
 #ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS_EX pmc;
-    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
-    std::cout << "Peak working set size: " << pmc.PeakWorkingSetSize / 1024 << " KB\n";
+    PROCESS_MEMORY_COUNTERS memory{};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &memory, static_cast<DWORD>(sizeof(memory))))
+        fail("Cannot read peak memory");
+    const auto kib = memory.PeakWorkingSetSize / 1024;
+#else
+    rusage memory{};
+    if (getrusage(RUSAGE_SELF, &memory) != 0) fail("Cannot read peak memory");
+#ifdef __APPLE__
+    const auto kib = memory.ru_maxrss / 1024; // macOS reports bytes.
+#else
+    const auto kib = memory.ru_maxrss;        // Linux reports KiB.
 #endif
+#endif
+    std::cout << "Peak resident memory: " << kib << " KiB\n";
 }
 
-// --- Utilities ---
-void print_progress(int current, int total, int dots = 50) {
-    int threshold = total / dots;
-    if (threshold == 0) threshold = 1;
-    if (current % threshold == 0) {
-        std::cout << "." << std::flush;
+void generate(const std::string& filename) {
+    std::ofstream output(filename, std::ios::binary);
+    if (!output) fail("Cannot create " + filename);
+    std::mt19937 random(42); // Fixed seed makes the laboratory input repeatable.
+    std::uniform_int_distribution<int> distribution(-1'000'000, 1'000'000);
+    Counts counts;
+    for (long long i = 0; i < NUMBER_COUNT; ++i) {
+        const int value = distribution(random);
+        output << value << '\n';
+        counts.count(value);
     }
+    output.close();
+    if (!output) fail("Writing the input file failed");
+    print_counts(counts); // Save these three counters to compare with every task.
 }
 
-void print_thread_progress(int& local_counter, int threshold = 1000000) {
-    if (++local_counter % threshold == 0) {
-        std::cout << "." << std::flush;
-    }
-}
-
-void generate_numbers(const std::string& filename) {
-    std::random_device rd;
-    auto now = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    std::seed_seq seq{
-        static_cast<unsigned int>(now),
-        rd(), rd(), rd(), rd(), rd(), rd(), rd()
-    };
-    std::mt19937 gen(seq);
-    std::uniform_int_distribution<int> dist(-1000000, 1000000);
-    
-    std::cout << "Generating 50,000,000 numbers to " << filename << " [";
-    std::ofstream out(filename);
-    int total = 50000000;
-    for (int i = 0; i < total; ++i) {
-        out << dist(gen) << '\n';
-        print_progress(i, total);
-    }
-    std::cout << "] Done!\n";
-}
-
-struct Counts {
-    long long neg = 0;
-    long long zero = 0;
-    long long pos = 0;
-    void add(long long n, long long z, long long p) { neg += n; zero += z; pos += p; }
-};
-
-// --- Task 1a ---
-void parse_chunk(const std::string& filename, std::streampos start, std::streampos end, Counts& counts) {
-    std::ifstream file(filename, std::ios::binary);
-    file.seekg(start);
-    long long neg = 0, zero = 0, pos = 0;
+void split(const std::string& filename, const std::filesystem::path& directory) {
+    auto input = open_input(filename);
+    std::filesystem::create_directories(directory);
     std::string line;
-    int local_progress = 0;
-    while (file.tellg() < end && std::getline(file, line)) {
-        if (line.empty() || line == "\r") continue;
-        int val = std::stoi(line);
-        if (val < 0) neg++;
-        else if (val == 0) zero++;
-        else pos++;
-        print_thread_progress(local_progress);
+    for (std::size_t i = 1; i <= FILE_COUNT; ++i) {
+        std::ofstream output(directory / ("split_" + std::to_string(i) + ".txt"), std::ios::binary);
+        if (!output) fail("Cannot create split file");
+        for (long long j = 0; j < NUMBER_COUNT / static_cast<long long>(FILE_COUNT); ++j) {
+            if (!std::getline(input, line)) fail("Input is shorter than 50,000,000 lines");
+            output << line << '\n';
+        }
+        output.close();
+        if (!output) fail("Writing a split file failed");
     }
-    counts.neg = neg; counts.zero = zero; counts.pos = pos;
+    if (std::getline(input, line)) fail("Input is longer than 50,000,000 lines");
+    std::cout << "Created 8 files of 6,250,000 numbers in " << directory << '\n';
 }
 
-void task1a(int num_threads, const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary | std::ios::ate);
-    if (!file) return;
-    std::streampos size = file.tellg();
-    std::vector<std::streampos> bounds = {0};
-    std::streampos chunk = size / num_threads;
-    for (int i = 1; i < num_threads; ++i) {
-        file.seekg(i * chunk);
-        std::string dummy;
-        std::getline(file, dummy);
-        bounds.push_back(file.tellg());
+// Task 1a: the main thread finds line boundaries; each worker reads its own range.
+Counts task1a(std::size_t n, const std::string& filename) {
+    auto input = open_input(filename, std::ios::ate);
+    const std::streamoff size = input.tellg();
+    std::vector<std::streamoff> bounds{0};
+    for (std::size_t i = 1; i < n; ++i) {
+        input.clear();
+        input.seekg((size / static_cast<std::streamoff>(n)) * static_cast<std::streamoff>(i));
+        std::string remainder;
+        std::getline(input, remainder); // Move the boundary to the next complete line.
+        bounds.push_back(input.eof() ? size : static_cast<std::streamoff>(input.tellg()));
     }
     bounds.push_back(size);
-    std::vector<Counts> t_counts(num_threads);
-    std::vector<std::thread> threads;
-    std::cout << "Task 1a counting [";
-    auto start_time = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < num_threads; ++i)
-        threads.emplace_back(parse_chunk, filename, bounds[i], bounds[i+1], std::ref(t_counts[i]));
-    for (auto& t : threads) t.join();
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::cout << "] Done!\n";
-    Counts total;
-    for (const auto& c : t_counts) total.add(c.neg, c.zero, c.pos);
-    std::cout << "Task 1a (" << num_threads << " threads) - Neg: " << total.neg << " Zero: " << total.zero << " Pos: " << total.pos << "\n";
-    std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << " ms\n";
-    print_memory();
-}
 
-// --- Task 1b ---
-void task1b(int version, int num_threads, const std::string& filename) {
-    std::vector<int> numbers;
-    numbers.reserve(50000000);
-    std::ifstream file(filename);
-    std::string line;
-    std::cout << "Loading file into memory [";
-    int current_line = 0;
-    int total_lines = 50000000;
-    while (std::getline(file, line)) {
-        if (!line.empty() && line != "\r") numbers.push_back(std::stoi(line));
-        print_progress(current_line++, total_lines);
-    }
-    std::cout << "] Done!\n";
-    long long shared_neg = 0, shared_zero = 0, shared_pos = 0;
-    std::mutex mtx;
-    std::vector<Counts> t_counts(num_threads);
-    auto worker = [&](int id, size_t start, size_t end) {
-        long long neg = 0, zero = 0, pos = 0;
-        int local_progress = 0;
-        for (size_t i = start; i < end; ++i) {
-            int val = numbers[i];
-            if (version == 1) { // Unsynchronized shared
-                if (val < 0) shared_neg++; else if (val == 0) shared_zero++; else shared_pos++;
-            } else if (version == 2) { // Mutex shared
-                std::lock_guard<std::mutex> lock(mtx);
-                if (val < 0) shared_neg++; else if (val == 0) shared_zero++; else shared_pos++;
-            } else { // Local
-                if (val < 0) neg++; else if (val == 0) zero++; else pos++;
+    std::vector<Counts> partial(n);
+    std::vector<std::thread> threads;
+    for (std::size_t id = 0; id < n; ++id) {
+        threads.emplace_back([&, id] {
+            auto file = open_input(filename);
+            file.seekg(bounds[id]);
+            Counts local;
+            std::string line;
+            auto position = bounds[id];
+            while (position < bounds[id + 1] && std::getline(file, line)) {
+                local.count(parse(line));
+                position += static_cast<std::streamoff>(line.size()) + 1; // Include the newline.
             }
-            print_thread_progress(local_progress);
-        }
-        if (version == 3) {
-            t_counts[id].neg = neg; t_counts[id].zero = zero; t_counts[id].pos = pos;
-        }
-    };
-    size_t chunk = numbers.size() / num_threads;
-    std::vector<std::thread> threads;
-    std::cout << "Task 1b v" << version << " counting [";
-    auto start_time = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk;
-        size_t end = (i == num_threads - 1) ? numbers.size() : (i + 1) * chunk;
-        threads.emplace_back(worker, i, start, end);
+            partial[id] = local;
+        });
     }
-    for (auto& t : threads) t.join();
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::cout << "] Done!\n";
-    Counts total;
-    if (version == 1 || version == 2) {
-        total.neg = shared_neg; total.zero = shared_zero; total.pos = shared_pos;
-    } else {
-        for (const auto& c : t_counts) total.add(c.neg, c.zero, c.pos);
-    }
-    std::cout << "Task 1b v" << version << " (" << num_threads << " threads) - Neg: " << total.neg << " Zero: " << total.zero << " Pos: " << total.pos << "\n";
-    std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << " ms\n";
-    print_memory();
+    for (auto& thread : threads) thread.join();
+    return combine(partial);
 }
 
-// --- Task 1c ---
-void task1c(int num_threads, const std::string& filename) {
-    std::queue<std::vector<int>> queue;
-    std::mutex q_mtx;
-    std::condition_variable q_not_full, q_not_empty;
-    bool done = false;
-    auto reader = [&]() {
-        std::ifstream file(filename);
-        std::string line;
-        std::vector<int> batch;
-        batch.reserve(10000);
-        while (std::getline(file, line)) {
-            if (line.empty() || line == "\r") continue;
-            batch.push_back(std::stoi(line));
-            if (batch.size() == 10000) {
-                std::unique_lock<std::mutex> lock(q_mtx);
-                q_not_full.wait(lock, [&]() { return queue.size() < 100; });
+// Task 1b: the array is loaded in main BEFORE starting the timer.
+Counts task1b(int version, std::size_t n, const std::vector<int>& numbers) {
+    Counts shared;
+    std::mutex mutex;
+    std::vector<Counts> partial(n);
+    std::vector<std::thread> threads;
+    for (std::size_t id = 0; id < n; ++id) {
+        threads.emplace_back([&, id] {
+            const auto begin = numbers.size() * id / n;
+            const auto end = numbers.size() * (id + 1) / n;
+            if (version == 1) {
+                // Intentional data race (undefined behavior in C++), required by the lab.
+                for (auto i = begin; i < end; ++i) shared.count(numbers[i]);
+            } else if (version == 2) {
+                for (auto i = begin; i < end; ++i) {
+                    std::lock_guard lock(mutex);
+                    shared.count(numbers[i]);
+                }
+            } else {
+                Counts local;
+                for (auto i = begin; i < end; ++i) local.count(numbers[i]);
+                partial[id] = local;
+            }
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    return version == 3 ? combine(partial) : shared;
+}
+
+// Task 1c: one reader, n workers, at most 100 queued batches of 10,000 raw lines.
+Counts task1c(std::size_t n, const std::string& filename) {
+    constexpr std::size_t READER_COUNT = 10;
+
+    // Split the file into three ranges, aligned to line boundaries.
+    auto input = open_input(filename, std::ios::ate);
+    const std::streamoff size = input.tellg();
+    std::vector<std::streamoff> bounds{0};
+
+    for (std::size_t i = 1; i < READER_COUNT; ++i) {
+        input.clear();
+        input.seekg(
+            (size / static_cast<std::streamoff>(READER_COUNT)) *
+            static_cast<std::streamoff>(i)
+        );
+
+        std::string remainder;
+        std::getline(input, remainder);
+        bounds.push_back(
+            input.eof() ? size : static_cast<std::streamoff>(input.tellg())
+        );
+    }
+    bounds.push_back(size);
+
+    using Batch = std::vector<std::string>;
+    std::queue<Batch> queue;
+    std::mutex mutex;
+    std::condition_variable not_empty, not_full;
+
+    // Protected by the same mutex as the queue.
+    std::size_t readers_left = READER_COUNT;
+    std::vector<Counts> partial(n);
+
+    std::vector<std::thread> readers;
+    for (std::size_t id = 0; id < READER_COUNT; ++id) {
+        readers.emplace_back([&, id] {
+            auto file = open_input(filename);
+            file.seekg(bounds[id]);
+
+            auto position = bounds[id];
+            const auto end = bounds[id + 1];
+
+            while (position < end) {
+                Batch batch;
+                batch.reserve(BATCH_SIZE);
+                std::string line;
+
+                while (batch.size() < BATCH_SIZE &&
+                       position < end &&
+                       std::getline(file, line)) {
+                    position +=
+                        static_cast<std::streamoff>(line.size()) + 1;
+                    batch.push_back(std::move(line));
+                }
+
+                if (batch.empty()) break;
+
+                std::unique_lock lock(mutex);
+                not_full.wait(lock, [&] {
+                    return queue.size() < QUEUE_LIMIT;
+                });
+
                 queue.push(std::move(batch));
                 lock.unlock();
-                q_not_empty.notify_one();
-                batch = std::vector<int>();
-                batch.reserve(10000);
+                not_empty.notify_one();
             }
-        }
-        if (!batch.empty()) {
-            std::unique_lock<std::mutex> lock(q_mtx);
-            q_not_full.wait(lock, [&]() { return queue.size() < 100; });
-            queue.push(std::move(batch));
-        }
-        {
-            std::lock_guard<std::mutex> lock(q_mtx);
-            done = true;
-        }
-        q_not_empty.notify_all();
-    };
 
-    std::vector<Counts> t_counts(num_threads);
-    auto worker = [&](int id) {
-        long long neg = 0, zero = 0, pos = 0;
-        int local_progress = 0;
-        while (true) {
-            std::vector<int> batch;
             {
-                std::unique_lock<std::mutex> lock(q_mtx);
-                q_not_empty.wait(lock, [&]() { return !queue.empty() || done; });
-                if (queue.empty() && done) break;
-                batch = std::move(queue.front());
-                queue.pop();
+                std::lock_guard lock(mutex);
+                --readers_left;
             }
-            q_not_full.notify_one();
-            for (int val : batch) {
-                if (val < 0) neg++; else if (val == 0) zero++; else pos++;
-                print_thread_progress(local_progress);
-            }
-        }
-        t_counts[id].neg = neg; t_counts[id].zero = zero; t_counts[id].pos = pos;
-    };
-
-    std::cout << "Task 1c counting [";
-    auto start_time = std::chrono::high_resolution_clock::now();
-    std::thread r_thread(reader);
-    std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i) threads.emplace_back(worker, i);
-    r_thread.join();
-    for (auto& t : threads) t.join();
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::cout << "] Done!\n";
-
-    Counts total;
-    for (const auto& c : t_counts) total.add(c.neg, c.zero, c.pos);
-    std::cout << "Task 1c (" << num_threads << " workers) - Neg: " << total.neg << " Zero: " << total.zero << " Pos: " << total.pos << "\n";
-    std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << " ms\n";
-    print_memory();
-}
-
-// --- Task 2 Split ---
-void split_files(const std::string& filename) {
-    std::ifstream file(filename);
-    std::string line;
-    std::cout << "Splitting into 8 files [";
-    int total_lines = 50000000;
-    int current_line = 0;
-    for (int i = 0; i < 8; ++i) {
-        std::ofstream out("split_" + std::to_string(i+1) + ".txt");
-        for (int j = 0; j < 6250000 && std::getline(file, line); ++j) {
-            out << line << '\n';
-            print_progress(current_line++, total_lines);
-        }
+            not_empty.notify_all();
+        });
     }
-    std::cout << "] Done!\n";
+
+    std::vector<std::thread> workers;
+    for (std::size_t id = 0; id < n; ++id) {
+        workers.emplace_back([&, id] {
+            Counts local;
+
+            while (true) {
+                Batch batch;
+
+                {
+                    std::unique_lock lock(mutex);
+                    not_empty.wait(lock, [&] {
+                        return !queue.empty() || readers_left == 0;
+                    });
+
+                    // The queue is empty and every reader has finished.
+                    if (queue.empty()) break;
+
+                    batch = std::move(queue.front());
+                    queue.pop();
+                }
+
+                not_full.notify_one();
+
+                // Parsing happens outside the queue lock.
+                for (const auto& line : batch)
+                    local.count(parse(line));
+            }
+
+            partial[id] = local;
+        });
+    }
+
+    for (auto& reader : readers) reader.join();
+    for (auto& worker : workers) worker.join();
+
+    return combine(partial);
 }
 
-// --- Task 2 Read ---
-void task2(int num_threads) {
-    std::vector<std::string> files;
-    for (int i = 1; i <= 8; ++i) files.push_back("split_" + std::to_string(i) + ".txt");
-    
-    std::vector<Counts> t_counts(num_threads);
-    auto worker = [&](int id) {
-        long long neg = 0, zero = 0, pos = 0;
-        int local_progress = 0;
-        for (size_t i = id; i < files.size(); i += num_threads) {
-            std::ifstream file(files[i], std::ios::binary | std::ios::ate);
-            if (!file) continue;
-            std::streamsize size = file.tellg();
-            file.seekg(0, std::ios::beg);
-            std::vector<char> buffer(size);
-            if (file.read(buffer.data(), size)) {
-                // Parse from memory buffer
-                std::string str(buffer.begin(), buffer.end());
-                std::istringstream iss(str);
-                std::string line;
-                while (std::getline(iss, line)) {
-                    if (line.empty() || line == "\r") continue;
-                    int val = std::stoi(line);
-                    if (val < 0) neg++; else if (val == 0) zero++; else pos++;
-                    print_thread_progress(local_progress);
-                }
-            }
-        }
-        t_counts[id].neg = neg; t_counts[id].zero = zero; t_counts[id].pos = pos;
-    };
-    
-    std::cout << "Task 2 counting [";
-    auto start_time = std::chrono::high_resolution_clock::now();
+// Task 2: files are distributed round-robin; each file gets one read into one buffer.
+Counts task2(std::size_t n, const std::filesystem::path& directory) {
+    std::vector<Counts> partial(n);
     std::vector<std::thread> threads;
-    for (int i = 0; i < num_threads; ++i) threads.emplace_back(worker, i);
-    for (auto& t : threads) t.join();
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::cout << "] Done!\n";
-    
-    Counts total;
-    for (const auto& c : t_counts) total.add(c.neg, c.zero, c.pos);
-    std::cout << "Task 2 (" << num_threads << " threads) - Neg: " << total.neg << " Zero: " << total.zero << " Pos: " << total.pos << "\n";
-    std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << " ms\n";
-    print_memory();
+    for (std::size_t id = 0; id < n; ++id) {
+        threads.emplace_back([&, id] {
+            Counts local;
+            for (std::size_t i = id; i < FILE_COUNT; i += n) {
+                auto input = open_input(directory / ("split_" + std::to_string(i + 1) + ".txt"), std::ios::ate);
+                const std::streamsize size = input.tellg();
+                if (size <= 0) fail("Empty or unreadable split file");
+                input.seekg(0);
+                std::vector<char> buffer(static_cast<std::size_t>(size));
+                if (!input.read(buffer.data(), size)) fail("Reading a split file failed");
+                Counts file_counts;
+                std::size_t begin = 0;
+                for (std::size_t end = 0; end < buffer.size(); ++end) {
+                    if (buffer[end] == '\n') {
+                        file_counts.count(parse(std::string_view(buffer.data() + begin, end - begin)));
+                        begin = end + 1;
+                    }
+                }
+                if (begin < buffer.size())
+                    file_counts.count(parse(std::string_view(buffer.data() + begin, buffer.size() - begin)));
+                if (file_counts.total() != NUMBER_COUNT / static_cast<long long>(FILE_COUNT))
+                    fail("A split file does not contain 6,250,000 numbers");
+                local.add(file_counts);
+            }
+            partial[id] = local;
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    return combine(partial);
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cout << "Usage:\n";
-        std::cout << "  generate\n";
-        std::cout << "  1a <threads> <file>\n";
-        std::cout << "  1b <version(1|2|3)> <threads> <file>\n";
-        std::cout << "  1c <threads> <file>\n";
-        std::cout << "  split <file>\n";
-        std::cout << "  2 <threads>\n";
+    try {
+        if (argc < 2) {
+            std::cout << "Usage:\n"
+                      << "  working generate [file=numbers.txt]\n"
+                      << "  working split <file> <output-directory>\n"
+                      << "  working 1a <threads> <file>\n"
+                      << "  working 1b <version:1|2|3> <file>  (uses logical processor count)\n"
+                      << "  working 1c <workers> <file>\n"
+                      << "  working 2 <threads:1|2|4> <USB-directory>\n";
+            return 1;
+        }
+        const std::string task = argv[1];
+        if (task == "generate" && (argc == 2 || argc == 3)) {
+            generate(argc == 3 ? argv[2] : "numbers.txt");
+            return 0;
+        }
+        if (task == "split" && argc == 4) {
+            split(argv[2], argv[3]);
+            return 0;
+        }
+        if (argc != 4 || (task != "1a" && task != "1b" && task != "1c" && task != "2"))
+            fail("Invalid arguments; run without arguments for usage");
+
+        const int argument = std::stoi(argv[2]);
+        if (task == "1b" ? (argument < 1 || argument > 3) : (argument < 1 || argument > 64))
+            fail("Invalid version or thread count");
+        if (task == "2" && argument != 1 && argument != 2 && argument != 4)
+            fail("Task 2 requires 1, 2, or 4 threads");
+        const std::size_t n = task == "1b" ? std::thread::hardware_concurrency() : static_cast<std::size_t>(argument);
+        if (n == 0) fail("Cannot detect logical processor count");
+
+        std::vector<int> numbers;
+        if (task == "1b") {
+            auto input = open_input(argv[3]);
+            numbers.reserve(static_cast<std::size_t>(NUMBER_COUNT));
+            std::string line;
+            while (std::getline(input, line)) numbers.push_back(parse(line));
+            if (numbers.size() != static_cast<std::size_t>(NUMBER_COUNT)) fail("Expected 50,000,000 numbers");
+        }
+
+        const auto start = Clock::now();
+        Counts result;
+        if (task == "1a") result = task1a(n, argv[3]);
+        else if (task == "1b") result = task1b(argument, n, numbers);
+        else if (task == "1c") result = task1c(n, argv[3]);
+        else result = task2(n, argv[3]);
+        const auto end = Clock::now();
+
+        std::cout << "Task " << task << ", " << n << (task == "1c" ? " workers + 1 reader" : " threads");
+        if (task == "1b") std::cout << ", version " << argument;
+        std::cout << '\n';
+        print_counts(result);
+        std::cout << std::fixed << std::setprecision(3)
+                  << "Time: " << std::chrono::duration<double, std::milli>(end - start).count() << " ms\n";
+        print_memory();
+        if (task == "1b" && argument == 1)
+            std::cout << "Intentional data race: totals may be incorrect.\n";
+        else if (result.total() != NUMBER_COUNT)
+            fail("Total must be 50,000,000; discard this run");
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
         return 1;
     }
-    
-    std::string task = argv[1];
-    if (task == "generate") {
-        generate_numbers("numbers.txt");
-    } else if (task == "1a" && argc >= 4) {
-        task1a(std::stoi(argv[2]), argv[3]);
-    } else if (task == "1b" && argc >= 5) {
-        task1b(std::stoi(argv[2]), std::stoi(argv[3]), argv[4]);
-    } else if (task == "1c" && argc >= 4) {
-        task1c(std::stoi(argv[2]), argv[3]);
-    } else if (task == "split" && argc >= 3) {
-        split_files(argv[2]);
-    } else if (task == "2" && argc >= 3) {
-        task2(std::stoi(argv[2]));
-    } else {
-        std::cerr << "Invalid arguments.\n";
-    }
-    return 0;
 }
