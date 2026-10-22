@@ -1,0 +1,32 @@
+\input{../metadata.tex}
+\selectlanguage{english}
+\utmlogo{../latex/assets/UTM_Logo_English.jpeg}
+\institution{Technical University of Moldova}
+\faculty{Faculty of Computers, Informatics, and Microelectronics}
+\department{Department of Software Engineering}
+\studyprogramme{Software Engineering Study Programme}
+\documenttype{Laboratory report}
+\student{\StudentName}{\StudentGroup}
+\renewcommand{\UTMStudentLabel}{Students}
+\supervisor{\InstructorName}{\InstructorTitle}
+\renewcommand{\UTMCoordinatorLabel}{Instructor}
+\cityyear{\ReportCity}{\ReportYear}
+\reportsubtitle{\CourseName}
+\hypersetup{pdfauthor={\StudentName},pdfsubject={\CourseName},
+  pdftitle={\ReportTitle}}
+\reporttitle{\ReportTitle}
+\addto\captionsenglish{\renewcommand{\figurename}{Figure}\renewcommand{\tablename}{Table}\renewcommand{\bibname}{References}}
+\renewcommand{\figurename}{Figure}
+\renewcommand{\tablename}{Table}
+\renewcommand{\bibname}{References}
+\usepackage{float}
+\usepackage{placeins}
+\setlength{\emergencystretch}{2em}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+% Keep screenshots beside their observations, with bounded height and width.
+\newcommand{\screenshot}[4][\textwidth]{%
+  \begin{figure}[H]
+    \centering
+    \includegraphics[width=#1,height=0.62\textheight,keepaspectratio]{screenshots/#2}
+    \caption{#3}\label{#4}
+  \end{figure}}
