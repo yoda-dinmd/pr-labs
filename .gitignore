@@ -1,6 +1,43 @@
-﻿.vscode
-build/
+# Editors and local environments
+.vscode/
+.idea/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated datasets, measurements, and C++ build products
+/lab*/data/
+/lab*/results/
+/lab*/build/
 numbers.txt
 split_*.txt
-lab1/build/
-lab1/results
+*.o
+*.a
+*.so
+compile_commands.json
+
+# Images are local inputs, including the supplied institutional logo.
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.webp
+*.gif
+
+# LaTeX artifacts and plot PDFs; only final reports in root build/ are versioned.
+*.aux
+*.log
+*.toc
+*.out
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.xdv
+*.bbl
+*.blg
+*.pdf
+/build/*
+!/build/lab*.pdf

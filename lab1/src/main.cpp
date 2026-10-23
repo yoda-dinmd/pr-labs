@@ -193,7 +193,7 @@ Counts task1b(int version, std::size_t n, const std::vector<int>& numbers) {
 
 // Task 1c: one reader, n workers, at most 100 queued batches of 10,000 raw lines.
 Counts task1c(std::size_t n, const std::string& filename) {
-    constexpr std::size_t READER_COUNT = 10;
+    constexpr std::size_t READER_COUNT = 1;
 
     // Split the file into three ranges, aligned to line boundaries.
     auto input = open_input(filename, std::ios::ate);

@@ -71,7 +71,7 @@ Operating system & openSUSE Tumbleweed, snapshot 20260901; Linux 7.2.7-1-default
 Language and compiler & C++23; cached compiler: Clang 23.1.2 \\\hline
 C++ runtime & Installed libstdc++6 package: 16.2.1+git9713-1.1 \\\hline
 Build configuration & Cache says Release; saved compilation flags contain no optimization flag \\\hline
-USB device and connection & Model, USB version, and negotiated link speed are not recorded in the supplied results \\\hline
+USB device and connection & Kingston DataTraveler 3.0, 115.5 GiB; current USB High-Speed connection at 480 Mbit/s \\\hline
 \end{tabularx}
 \end{table}
 The saved flags include \code{-std=c++23} and warning options but no
@@ -79,6 +79,15 @@ The saved flags include \code{-std=c++23} and warning options but no
 level from a Release cache entry alone. The results should not be presented as
 verified optimized-build performance. Task 1b records eight threads, consistent
 with the workstation's logical processor count.
+
+The USB drive was inspected on 23 October 2026. The block-device inventory
+identifies it as a Kingston DataTraveler 3.0 with 115.5 GiB capacity.
+Its USB vendor/product identifier is \code{0951:1666}. The USB device tree
+and sysfs both report a current link speed of 480 Mbit/s (USB High-Speed);
+the device descriptor reports version 2.10 for this connection. Thus the
+``3.0'' product name should not be interpreted as the negotiated link speed.
+This inspection records the connected device without rerunning Task 2;
+the earlier benchmark CSV does not preserve its historical connection speed.
 
 \section{Input and correctness}
 The input file contains 50,000,000 integers in the range $[-1,000,000,1,000,000]$,
@@ -366,8 +375,9 @@ are end-to-end processing rates, not isolated device read speeds.
 
 The comparison changes both cache policy and reading strategy: Task 1a uses
 warm-cache line streaming, while Task 2 reads whole files under the recorded
-reconnect policy. It does not isolate USB latency. Moreover, the USB model and
-link version are absent. The available numbers therefore support a mixed
+reconnect policy. It does not isolate USB latency. The identified Kingston
+DataTraveler 3.0 currently negotiates 480 Mbit/s, but the link speed during the
+earlier measurements was not recorded. The available numbers support a mixed
 storage-and-parsing workload, but do not conclusively establish that USB I/O
 alone dominates execution time.
 
@@ -452,7 +462,8 @@ prevent attributing the entire difference to reader count alone.
 Warm-cache file parsing and in-memory counting are consistent with CPU-side
 work and synchronization costs. The USB series benefits from extra threads
 but shows sublinear scaling and substantially greater memory use from whole-file
-buffers. Its data do not isolate a purely I/O-bound bottleneck. Missing USB
-identification, uncertain historical build flags, and the absence of resource
-profiling limit stronger machine-specific conclusions.
+buffers. Its data do not isolate a purely I/O-bound bottleneck. The USB drive
+is now identified, with a currently observed 480 Mbit/s connection. Unrecorded
+historical link speed, uncertain historical build flags, and the absence of
+resource profiling limit stronger machine-specific conclusions.
 \end{document}

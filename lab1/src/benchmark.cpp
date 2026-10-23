@@ -122,7 +122,7 @@ int main(int argc, char* argv[]) {
                 if (!reference) reference = result.signs;
                 const bool match = result.signs == *reference && result.total == 50'000'000;
                 const int workers = task == "1c" ? result.concurrency : 0;
-                const int threads = result.concurrency + (task == "1c" ? 10 : 0);
+                const int threads = result.concurrency + (task == "1c" ? 1 : 0);
                 csv << task << ',' << (task == "1b" ? setting : 0) << ',' << threads << ',' << workers << ',' << run
                     << ',' << result.time_ms << ',' << result.peak_kib << ',' << result.signs[0] << ',' << result.signs[1]
                     << ',' << result.signs[2] << ',' << result.total << ',' << (match ? "true" : "false") << ',' << policy << '\n';
