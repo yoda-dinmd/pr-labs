@@ -1,6 +1,8 @@
 # Editors and local environments
 .vscode/
 .idea/
+*.iml
+.DS_Store
 .venv/
 venv/
 __pycache__/
@@ -16,6 +18,15 @@ split_*.txt
 *.a
 *.so
 compile_commands.json
+
+# Java and Maven build products
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+*.ear
+hs_err_pid*
 
 # Images are local inputs, including the supplied institutional logo.
 *.png
