@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/cmake_install.cmake",
+		"/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/_deps/nlohmann_json-build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

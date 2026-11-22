@@ -1,0 +1,62 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/opt/cmake-4.2.0-linux-x86_64/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:16 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/opt/cmake-4.2.0-linux-x86_64/bin/"
+      - "/home/gabi/.local/bin/"
+      - "/home/gabi/bin/"
+      - "/usr/local/bin/"
+      - "/usr/bin/"
+      - "/var/lib/snapd/snap/bin/"
+      - "/home/gabi/.dotnet/tools/"
+      - "/home/gabi/.local/share/JetBrains/Toolbox/bin/"
+      - "/home/gabi/.local/share/JetBrains/Toolbox/scripts/"
+      - "/bin/"
+    searched_directories:
+      - "/opt/cmake-4.2.0-linux-x86_64/bin/uname"
+      - "/home/gabi/.local/bin/uname"
+      - "/home/gabi/bin/uname"
+      - "/usr/local/bin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/opt/cmake-4.2.0-linux-x86_64/bin"
+        - "/opt/cmake-4.2.0-linux-x86_64/bin"
+        - "/opt/cmake-4.2.0-linux-x86_64/bin"
+        - "/home/gabi/.local/bin"
+        - "/home/gabi/bin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/var/lib/snapd/snap/bin"
+        - "/home/gabi/.dotnet/tools"
+        - "/home/gabi/.local/share/JetBrains/Toolbox/bin"
+        - "/home/gabi/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/gabi/.local/share/JetBrains/Toolbox/bin"
+        - "/home/gabi/.local/share/JetBrains/Toolbox/scripts"
+        - "/home/gabi/.local/share/JetBrains/Toolbox/bin"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/cmake-4.2.0-linux-x86_64/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:16 (project)"
+    message: |
+      The system is: Linux - 7.3.4-100.fc43.x86_64 - x86_64
+...
