@@ -3,6 +3,8 @@ import tools.jackson.databind.ObjectMapper;
 import java.io.*;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class Main {
     static void main(String[] args) throws IOException {
@@ -14,6 +16,7 @@ public class Main {
         int portNumber = Integer.parseInt(args[1]);
         String role = args[2];
         try (
+                var heartbeatExecutor = Executors.newSingleThreadScheduledExecutor();
                 Socket clientSocket = new Socket(hostName, portNumber);
                 BufferedReader stdIn = new BufferedReader(new InputStreamReader(System.in))
         ) {
@@ -29,6 +32,8 @@ public class Main {
                 String json = mapper.writeValueAsString(new Protocol.EmptyMessage(Protocol.MessageType.PROVIDER_IDENTIFY));
                 out.println(json);
             }
+            String heartbeat = mapper.writeValueAsString(new Protocol.EmptyMessage(Protocol.MessageType.HEARTBEAT));
+            heartbeatExecutor.scheduleAtFixedRate(() -> out.println(heartbeat), 0, 1500, TimeUnit.MILLISECONDS);
 
             while ((userInput = stdIn.readLine()) != null) {
                 switch (userInput.trim().toLowerCase()) {

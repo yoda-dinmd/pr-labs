@@ -13,6 +13,7 @@ public class Protocol {
         PROVIDER_IDENTIFY,
         DELIVERY,
         LOW_STOCK,
+        HEARTBEAT,
         ERROR
     }
 

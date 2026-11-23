@@ -11,6 +11,7 @@ include(FetchContent)
 FetchContent_Declare(
     nlohmann_json
     URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
@@ -36,4 +37,6 @@ function(add_quiz target path)
 endfunction()
 
 add_quiz(server src/server.cpp)
-add_quiz(jsontest src/jsontest.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/jsontest.cpp")
+    add_quiz(jsontest src/jsontest.cpp)
+endif()
