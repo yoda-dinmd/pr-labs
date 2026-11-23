@@ -1,6 +1,0 @@
-/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/CMakeFiles/server.dir
-/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/CMakeFiles/jsontest.dir
-/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/CMakeFiles/edit_cache.dir
-/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/CMakeFiles/rebuild_cache.dir
-/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/_deps/nlohmann_json-build/CMakeFiles/edit_cache.dir
-/home/gabi/University Stuff/Yr_3/NetworkProgramming/lab2/server/build/_deps/nlohmann_json-build/CMakeFiles/rebuild_cache.dir

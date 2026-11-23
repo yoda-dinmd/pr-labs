@@ -52,3 +52,4 @@ hs_err_pid*
 *.pdf
 /build/*
 !/build/lab*.pdf
+/lab*/**/build/
