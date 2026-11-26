@@ -1,0 +1,327 @@
+\documentclass{../latex/utmreport}
+\newcommand{\ReportTitle}{Lab 2: A Coffee Shop Server}
+\input{../latex/report-common.tex}
+\IfFontExistsTF{Latin Modern Mono}{}{\IfFontExistsTF{Liberation Mono}{\setmonofont[Scale=0.84]{Liberation Mono}}{}}
+\setlength{\emergencystretch}{4em}
+\lstset{basicstyle=\ttfamily\small}
+
+\newcommand{\labfigure}[3]{%
+  \begin{figure}[H]\centering
+  \includegraphics[width=\textwidth,height=0.65\textheight,keepaspectratio]{figures/#1.png}
+  \caption{#2}\label{#3}
+  \end{figure}}
+
+\begin{document}
+\makeutmreporttitlepage
+\tableofcontents
+\clearpage
+
+\begin{utmabstract}[Abstract]
+This report presents the design and implementation of a multi-client Coffee Shop TCP system built directly over socket APIs without higher-level HTTP, WebSocket, or RPC wrappers. The server is written in C++23 using POSIX sockets, per-connection reader threads, a \code{ThreadPool} backed by a \code{ThreadSafeQueue} sized to the host's logical processor count, and a strict newline-delimited JSON protocol powered by \code{nlohmann::json}. A unified Java~27 console application (using \code{java.net.Socket} and Jackson~3.2.4) implements both the customer client and the supplier provider roles. We detail the shared-state synchronization model, per-connection stream framing, three-second heartbeat timeout enforcement, cooperative task cancellation via \code{std::stop_token}, simulated client--server and server--provider message flows, and complete answers to all defense and control questions.
+\utmkeywords{TCP sockets, client--server, producer--consumer, thread pool, mutex, heartbeat, stop token, JSON framing}
+\end{utmabstract}
+
+\chapter*{Abbreviations}
+\addcontentsline{toc}{chapter}{Abbreviations}
+\noindent\begin{tabularx}{\textwidth}{lY}
+API & Application programming interface \\
+CPU & Central processing unit \\
+CRLF & Carriage return followed by line feed (\texttt{\textbackslash r\textbackslash n}) \\
+EOF & End of file (orderly TCP stream close, \code{recv() == 0}) \\
+ETA & Estimated time of arrival / preparation time \\
+FD & File descriptor \\
+FIFO & First in, first out \\
+JSON & JavaScript Object Notation \\
+OS & Operating system \\
+RAII & Resource Acquisition Is Initialization \\
+RPC & Remote procedure call \\
+RST & TCP Reset segment \\
+SMT & Simultaneous multithreading \\
+TCP & Transmission Control Protocol \\
+UTF-8 & 8-bit Unicode Transformation Format \\
+\end{tabularx}
+
+\utmintroduction
+Networked services rarely operate on isolated, single-request connections. Even a small order-processing server must handle concurrent clients, preserve shared inventory invariants under contention, report asynchronous completions without blocking incoming traffic, and recover gracefully when peers disconnect or transmit malformed payloads. In Laboratory Work~2, these challenges are explored through a simulated coffee shop implemented directly over TCP sockets.
+
+The system consists of three roles across two languages: a multi-threaded C++23 server (\code{lab2/server}) and an interactive Java~27 console program (\code{lab2/client}) that starts in either the \code{client} or \code{provider} role. All messages travel as UTF-8 JSON objects delimited by \texttt{\textbackslash n} over raw TCP streams. Every connection, accepted or refused order, completion, cancellation, delivery, low-stock alert, and protocol error is logged on the server alongside the peer's \code{ip:port} endpoint.
+
+The sections that follow explain the overall system architecture and wire protocol, walk through the server and client/provider implementations, illustrate representative protocol conversations with simulated diagrams, and provide detailed answers to every task defense question and control question.
+
+\chapter{System Overview, Environment, and Protocol}
+
+\section{General architecture and workflow}
+The Coffee Shop application follows a stateful client--server architecture with an asynchronous producer--consumer worker pipeline inside the server (Figure~\ref{fig:arch}). Rather than blocking a client connection while an order is prepared, the server separates network I/O from simulated preparation work:
+
+\begin{enumerate}
+  \item \textbf{Connection acceptance:} The server's \code{main} thread opens one listening TCP socket bound to \code{INADDR_ANY} on the configured port. Each accepted client connection receives a \code{ClientSession} object containing its socket file descriptor, \code{ip:port} endpoint, send mutex, provider role flag, and active order list, and is served by a dedicated \code{std::jthread}.
+  \item \textbf{Buffered line framing and heartbeat tracking:} Each session thread polls its socket in 500\,ms slices against a 3-second \code{HEARTBEAT_TIMEOUT} deadline. Incoming bytes from \code{recv()} accumulate in a per-connection \code{line_buffer}, which splits requests on \texttt{\textbackslash n} boundaries regardless of TCP segmentation.
+  \item \textbf{Immediate request handling:} \code{MENU_REQUEST} reads a mutex-protected snapshot of stock and replies immediately. \code{ORDER_REQUEST} atomically checks and deducts stock under \code{stock_mutex_}, assigns a monotonic \code{orderId}, replies immediately with \code{ORDER_ACCEPTED} (or \code{ORDER_REFUSED} if insufficient), pushes \code{LOW_STOCK} alerts if an ordered product drops below 5, and submits preparation as a \code{std::packaged_task} to the \code{ThreadPool}.
+  \item \textbf{Worker preparation and completion:} A fixed pool of \code{N = hardware_concurrency()} worker threads dequeues tasks in FIFO order from \code{ThreadSafeQueue}. Each worker waits for the order's preparation duration using an interruptible \code{std::condition_variable_any::wait_for} tied to the order's \code{std::stop_token}, then sends \code{ORDER_READY} under the session's \code{send_mutex}.
+  \item \textbf{Provider and fault tolerance:} A provider identifies itself once via \code{PROVIDER_IDENTIFY}, receives immediate catch-up alerts for any product below 5, receives live \code{LOW_STOCK} pushes when orders deplete stock below 5, and replenishes inventory via \code{DELIVERY}. If any client disconnects or misses its 3-second heartbeat, its queued and active tasks are stopped via \code{stop_source.request_stop()} and their unfinalized products are returned to stock once.
+\end{enumerate}
+
+\labfigure{fig_architecture}{High-level Coffee Shop system architecture and server concurrency model}{fig:arch}
+
+\section{Environment and build configuration}
+Table~\ref{tab:env} summarizes the local workstation hardware inspected when preparing this report together with the build toolchains declared in \code{lab2/server/CMakeLists.txt} and \code{lab2/client/pom.xml}. Note that the report-generation environment runs OpenJDK~21 in the sandbox, while \code{lab2/client/pom.xml} specifies JDK~27 and Jackson~3.2.4 for building and executing the Java client on the host.
+
+\begin{table}[H]\centering
+\caption{Workstation inventory and project build configuration}\label{tab:env}
+\begin{tabularx}{\textwidth}{|p{0.30\textwidth}|Y|}\hline
+Component & Configuration / Recorded Value \\\hline
+Workstation CPU & AMD Ryzen 5 4600H (6 physical cores, 12 logical processors, 2 SMT threads/core) \\\hline
+System Memory & 14\,GiB RAM, 8.0\,GiB swap \\\hline
+Operating System & Fedora Linux 43 (Workstation Edition), x86-64 \\\hline
+Server Language \& Standard & C++23 (\code{CMAKE_CXX_STANDARD 23}, \code{CMAKE_CXX_EXTENSIONS OFF}) \\\hline
+C++ Compiler & GCC 15.3.1 (\code{g++}); CMake $\ge 3.20$ \\\hline
+Server Compiler Warnings & \code{-Wall -Wextra -Wpedantic -Werror -Wshadow -Wconversion -Wsign-conversion -Wnull-dereference} \\\hline
+JSON Library (Server) & \code{nlohmann::json} v3.12.0 via CMake \code{FetchContent} \\\hline
+Client/Provider Toolchain & Java (JDK~27 target in \code{pom.xml}), Maven, \code{tools.jackson.core:jackson-databind:3.2.4} \\\hline
+Worker Pool Size & \code{std::thread::hardware_concurrency()} (12 logical processors on this workstation; fallback 4) \\\hline
+\end{tabularx}
+\end{table}
+
+\section{Domain rules and JSON wire protocol}
+The Coffee Shop sells three products whose preparation times sum linearly per order (Table~\ref{tab:products}). On startup, the server seeds each product independently with a uniform random integer in $[10, 50]$.
+
+\begin{table}[H]\centering
+\caption{Coffee shop products and preparation times}\label{tab:products}
+\begin{tabular}{lrr}\hline
+Product & Preparation Time (s) & Initial Stock Range \\\hline
+\code{coffee} & 4 & $10\text{--}50$ \\
+\code{tea} & 3 & $10\text{--}50$ \\
+\code{croissant} & 2 & $10\text{--}50$ \\\hline
+\end{tabular}
+\end{table}
+
+For example, an order of 1~coffee, 1~tea, and 2~croissants takes $1 \cdot 4 + 1 \cdot 3 + 2 \cdot 2 = 11$\,seconds. Every message on the wire is a single-line UTF-8 JSON object containing a \code{type} field and terminated with \texttt{\textbackslash n}. To avoid duplicating message classes, the final protocol (\code{coffee_shop_protocol_final.md}) plus the \code{HEARTBEAT} keepalive extension maps all 11~message types onto 8~reusable data structures (Table~\ref{tab:protocol}).
+
+\begin{table}[H]\centering
+\caption{Protocol message types, directions, and reusable C++/Java structures}\label{tab:protocol}
+\begin{tabularx}{\textwidth}{|p{0.23\textwidth}|p{0.19\textwidth}|p{0.20\textwidth}|Y|}\hline
+\code{MessageType} & Direction & Structure & Key Fields / Rules \\\hline
+\code{MENU_REQUEST} & Client/Prov $\to$ Srv & \code{EmptyMessage} & \code{type} only \\\hline
+\code{MENU_RESPONSE} & Server $\to$ Client & \code{ItemsMessage} & \code{type}, \code{items} (all 3 keys required) \\\hline
+\code{ORDER_REQUEST} & Client $\to$ Server & \code{ItemsMessage} & \code{type}, \code{items} (missing $=0$, $\ge 1$ item $>0$) \\\hline
+\code{ORDER_ACCEPTED} & Server $\to$ Client & \code{AcceptedMessage} & \code{type}, \code{orderId} ($>0$), \code{preparationTime} ($\ge 0$) \\\hline
+\code{ORDER_REFUSED} & Server $\to$ Client & \code{RefusedMessage} & \code{type}, \code{reason} (insufficient stock) \\\hline
+\code{ORDER_READY} & Server $\to$ Client & \code{OrderIdMessage} & \code{type}, \code{orderId} ($>0$, sent async) \\\hline
+\code{PROVIDER_IDENTIFY} & Provider $\to$ Server & \code{EmptyMessage} & \code{type} only; sets provider role \\\hline
+\code{DELIVERY} & Provider $\to$ Server & \code{ItemsMessage} & \code{type}, \code{items} ($\ge 1$ item $>0$; provider only) \\\hline
+\code{LOW_STOCK} & Server $\to$ Provider & \code{LowStockMessage} & \code{type}, \code{product}, \code{remaining} ($0\text{--}4$) \\\hline
+\code{HEARTBEAT} & Client/Prov $\to$ Srv & \code{EmptyMessage} & \code{type} only; resets 3\,s liveness timer \\\hline
+\code{ERROR} & Server $\to$ Peer & \code{ErrorMessage} & \code{type}, \code{code} (\code{ErrorCode}), \code{message} \\\hline
+\end{tabularx}
+\end{table}
+
+Malformed payloads, missing fields, unknown fields, non-integer/negative quantities, unknown products, and unauthorized deliveries are rejected with an \code{ERROR} message carrying one of six \code{ErrorCode} values: \code{INVALID_MESSAGE}, \code{MISSING_FIELD}, \code{INVALID_QUANTITY}, \code{UNKNOWN_PRODUCT}, \code{UNAUTHORIZED_OPERATION}, or \code{INVALID_DELIVERY}.
+
+\chapter{Implementation Walkthrough}
+
+\section{C++23 Server}
+The server is organized into four focused source files built via \code{lab2/server/CMakeLists.txt} (which fetches \code{nlohmann::json} v3.12.0 automatically and enforces strict warning flags with \code{-Werror}):
+
+\begin{itemize}
+  \item \textbf{\code{include/protocol.h}:} Defines \code{MessageType}, \code{ErrorCode}, \code{Product}, the shared \code{Items} struct, the seven message structs, and \code{detail::EnumTraits} with \code{constexpr} \code{to_string} and \code{from_string} helpers. Every \code{to_json} and \code{from_json} function validates object keys (rejecting missing required keys with \code{MISSING_FIELD} and unexpected keys with \code{INVALID_MESSAGE}), enforces strict integer range checks (rejecting floats, booleans, strings, negatives, and 64-bit overflows), checks \code{LOW_STOCK} bounds ($0\text{--}4$), and requires at least one positive quantity for \code{ORDER_REQUEST} and \code{DELIVERY}. Any violation throws \code{ProtocolException(ErrorCode, message)}, which \code{server.cpp} catches to construct the corresponding \code{ERROR} response. Top-level dispatch uses \code{parse_message_type()} and \code{deserialize_message()}, returning \code{std::variant<...>}.
+  \item \textbf{\code{include/ThreadSafeQueue.h} and \code{include/ThreadPool.h}:} Provide a mutex-and-condition-variable FIFO queue (\code{push}, \code{wait_and_pop}, \code{close}) and a fixed-size pool of \code{std::jthread} workers. \code{submitTask()} wraps each callable in a \code{std::packaged_task} shared across the queue lambda and returns a \code{std::future}. Both headers were preserved unmodified.
+  \item \textbf{\code{src/server.cpp}:} Implements \code{CoffeeShopServer}, \code{ClientSession}, and \code{OrderRecord}. Upon startup, \code{main()} disables \code{SIGPIPE}, installs \code{SIGINT}/\code{SIGTERM} handlers, parses the optional CLI port (default \code{8000}), and starts \code{CoffeeShopServer} with \code{hardware_concurrency()} workers. Each accepted socket creates a \code{ClientSession} served by its own \code{std::jthread}.
+\end{itemize}
+
+Inside \code{server.cpp}, lock scopes are intentionally narrow and non-nested so slow network writes can never stall shared inventory operations:
+\begin{enumerate}
+  \item \code{stock_mutex_} protects only \code{stock_} and \code{next_order_id_} during reads, atomic order deductions, deliveries, and disconnect restorations.
+  \item \code{provider_mutex_} protects only the \code{active_provider_} \code{std::shared_ptr}.
+  \item \code{session->orders_mutex} guards the session's \code{disconnected} flag and \code{active_orders} vector so an order cannot be inserted after disconnect cleanup runs.
+  \item \code{session->send_mutex} serializes outgoing \code{send_all()} calls (with \code{MSG_NOSIGNAL}) and socket closure (\code{close_socket()}), ensuring messages never interleave and a worker never writes to a closed/reused FD.
+  \item \code{log_mutex_} protects \code{std::cout} so multi-threaded log lines prefixed with \code{[ip:port]} remain intact.
+\end{enumerate}
+
+For order preparation, the lambda submitted to \code{pool_.submitTask()} captures \code{session}, \code{order} (containing \code{order_id}, \code{client_ip}, \code{client_port}, \code{items}, \code{stop_source}, and \code{std::atomic<bool> finalized}), and \code{stop_tok}. If the client disconnects or exceeds the 3-second heartbeat timeout while an order is waiting in the queue or sleeping in \code{std::condition_variable_any::wait_for}, \code{disconnect_session()} invokes \code{stop_source.request_stop()} (waking the worker immediately) and uses \code{order->finalized.exchange(true)} so reserved products are returned to \code{stock_} immediately and at most once.
+
+\section{Java Client and Provider}
+Both customer clients and the supplier provider run from the same Java~27 program (\code{Main <host> <port> <client|provider>}) built with raw \code{java.net.Socket} streams and Jackson~3.2.4:
+
+\begin{itemize}
+  \item \textbf{\code{Protocol.java}:} Mirrors the C++ protocol verbatim using Java enums (\code{MessageType}, \code{ErrorCode}, \code{Product}) and records (\code{Items} plus the 7 message records) annotated with \code{@JsonInclude(}\allowbreak\code{JsonInclude.Include.NON_NULL)}.
+  \item \textbf{\code{Main.java}:} Opens the TCP socket with UTF-8 \code{PrintWriter} (auto-flush enabled so each \code{out.println()} emits one \texttt{\textbackslash n}-terminated JSON line) and \code{BufferedReader}, spawns \code{ServerListener} on a daemon thread, sends \code{PROVIDER_IDENTIFY} immediately when launched with \code{provider}, and starts a single-thread \code{ScheduledExecutorService} sending \code{{"type":"HEARTBEAT"}} every \code{1500 ms}. Meanwhile, the main thread reads interactive console commands (\code{menu}, \code{order}, \code{deliver}, \code{raw}, \code{exit}) and validates non-negative integer quantities locally before sending (except \code{raw}, which transmits arbitrary payloads verbatim for error-handling tests).
+  \item \textbf{\code{ServerListener.java}:} Continuously blocks on \code{in.readLine()}, parsing each incoming JSON line and immediately printing formatted summaries for \code{MENU_RESPONSE}, \code{ORDER_ACCEPTED}, \code{ORDER_REFUSED}, \code{ORDER_READY}, \code{LOW_STOCK}, and \code{ERROR} without interfering with keyboard input. When \code{readLine()} returns \code{null} (server disconnect) or throws \code{IOException}, it prints a clean status message and terminates the process.
+\end{itemize}
+
+\section{End-to-End Test Suite Coverage}
+The repository also includes a comprehensive Python test suite (\code{lab2/test_client_server.py}) defining 31 automated test cases across three groups: wire-level verification of the Java client against a mock socket server (2 tests), end-to-end tests pairing the real Java client/provider with the real C++ server across concurrent orders, low-stock boundaries, \code{SIGKILL} cancellation, and shutdown (20 tests), and raw TCP edge-case tests covering malformed envelopes, integer overflow, partial/coalesced/CRLF framing, the 8192-byte line limit, 3-second heartbeat timeouts, and 16-thread contention stress (9 tests).
+
+\chapter{Simulated Protocol Conversations}
+
+To illustrate the runtime interactions specified by the protocol, Figures~\ref{fig:conv1}--\ref{fig:conv3} depict three simulated end-to-end conversations between the Java client/provider and the C++ server.
+
+\section{Client menu, concurrent ordering, and asynchronous completion}
+Figure~\ref{fig:conv1} simulates a customer session querying stock, placing a multi-item order (1~coffee, 1~tea, 2~croissants = 11\,s), continuing to query the menu and attempt another order while Worker~\#1 prepares Order~\#1, and finally receiving \code{ORDER_READY} asynchronously alongside background \code{HEARTBEAT} keepalives.
+
+\labfigure{fig_client_order_conv}{Simulated conversation 1: menu snapshot, immediate acceptance, non-blocking queries, refusal, and asynchronous completion}{fig:conv1}
+
+\noindent\begin{minipage}{\textwidth}
+\noindent A corresponding server log sequence for this scenario follows the exact log format emitted by \code{server.cpp}:
+\begin{lstlisting}[style=utmcode]
+[server] Listening on port 8000 | Initial stock: coffee=24, tea=31, croissant=18
+[127.0.0.1:51420] Client connected
+[127.0.0.1:51420] ORDER ACCEPTED #1 (coffee=1, tea=1, croissant=2), eta=11s
+[127.0.0.1:51420] ORDER REFUSED: Insufficient coffee (requested 99, available 23)
+[127.0.0.1:51420] ORDER READY #1
+\end{lstlisting}
+\end{minipage}
+
+\section{Provider identification, low-stock alerts, and delivery}
+Figure~\ref{fig:conv2} simulates authorization and supplier workflows: a regular client attempting \code{DELIVERY} is rejected with \code{UNAUTHORIZED_OPERATION}; an order reduces \code{tea} to $3$ ($< 5$) before any provider connects; as soon as the provider identifies itself with \code{PROVIDER_IDENTIFY}, the server immediately pushes \code{LOW_STOCK} for \code{tea}; a subsequent order dropping \code{coffee} to $4$ triggers an immediate live \code{LOW_STOCK} alert to the active provider; finally, the provider's \code{DELIVERY} replenishes both products under \code{stock_mutex_}.
+
+\labfigure{fig_provider_lowstock_conv}{Simulated conversation 2: unauthorized delivery rejection, catch-up and live low-stock alerts, and replenishment}{fig:conv2}
+
+\section{Failure recovery, heartbeat timeout, and TCP framing}
+Figure~\ref{fig:conv3} illustrates both fault recovery and wire framing. On the left, Client~B disappears (via \code{SIGKILL} or missing \code{HEARTBEAT} for 3.0\,s) while its order is active; \code{disconnect_session()} invokes \code{stop_source.request_stop()}, wakes the preparing worker immediately, skips queued orders, restores reserved stock atomically via \code{finalized.exchange(true)}, and leaves the shop healthy. On the right, \code{line_buffer} handles split \code{recv()} reads, coalesced messages, invalid JSON errors, and lines exceeding \code{MAX_LINE_BYTES = 8192} without disconnecting healthy peers.
+
+\labfigure{fig_failure_framing_conv}{Simulated conversation 3: disconnect/heartbeat cancellation (left) and TCP framing with error isolation (right)}{fig:conv3}
+
+\chapter{Task Defense Questions}
+
+\section{Task 1: One client}
+\subsection{Cutting received bytes into messages (split and coalesced packets)}
+In \code{server.cpp}, each \code{ClientSession} maintains a persistent \code{std::string line_buffer} alongside a 4096-byte \code{chunk} read buffer. Every \code{recv()} appends the newly arrived bytes onto \code{line_buffer}, and an inner \code{while} loop searches for \texttt{'\textbackslash n'} (\code{line_buffer.find(}\allowbreak\texttt{'\textbackslash n')}).
+\begin{itemize}
+  \item \textbf{One message arriving in two pieces:} After the first \code{recv()}, \code{find(}\allowbreak\texttt{'\textbackslash n')} returns \code{std::string::npos}, so the loop stops without parsing and keeps the partial prefix in \code{line_buffer}. When the second \code{recv()} delivers the suffix containing \texttt{\textbackslash n}, the reassembled full JSON line is extracted and parsed.
+  \item \textbf{Two messages arriving in one \code{recv()}:} Both payloads are appended into \code{line_buffer}, and the \code{while} loop extracts, erases, and dispatches the first message up to the first \texttt{\textbackslash n}, then immediately finds the second \texttt{\textbackslash n} and dispatches the second message in the same loop iteration.
+\end{itemize}
+On the Java side, \code{BufferedReader.readLine()} performs the identical newline-delimited buffering.
+
+\subsection{Why the server answers at once and notifies later}
+Order preparation takes several seconds ($4$\,s per coffee, $3$\,s per tea, $2$\,s per croissant). By deducting stock immediately, replying at once with \code{ORDER_ACCEPTED} (\code{orderId} and \code{preparationTime}), and offloading waiting to a worker thread, the client's connection thread returns immediately to reading from the socket. The client can therefore keep requesting \code{MENU_REQUEST}, placing additional orders, and sending \code{HEARTBEAT} pings while waiting. If the server instead slept inside the client-handling thread before replying, the client would freeze for the entire preparation duration, miss \code{HEARTBEAT} handling, be unable to query the menu or cancel cleanly, and waste client-facing responsiveness.
+
+\section{Task 2: Many clients}
+\subsection{Shared data and synchronization mechanisms}
+Table~\ref{tab:shared} lists every piece of state shared across threads in \code{server.cpp} and how each is protected.
+
+\begin{table}[H]\centering
+\caption{Shared server state and protection mechanisms}\label{tab:shared}
+\begin{tabularx}{\textwidth}{|p{0.29\textwidth}|p{0.24\textwidth}|Y|}\hline
+Shared Data & Accessing Threads & Protection Mechanism \\\hline
+\code{stock_} \& \code{next_order_id_} & Client reader threads, worker threads (cancellation restore) & \code{std::mutex stock_mutex_} with short \code{std::lock_guard} scopes \\\hline
+Worker task queue (\code{m_queue}) & Client threads (producers) and \code{ThreadPool} workers (consumers) & \code{ThreadSafeQueue}: \code{m_mutex} + \code{std::condition_variable} \\\hline
+\code{active_provider_} & Client/provider threads & \code{std::mutex provider_mutex_} \\\hline
+\code{session->active_orders} \& \code{disconnected} & Client reader thread and worker threads & \code{std::mutex orders_mutex} per \code{ClientSession} \\\hline
+\code{session->fd} writes & Client reader thread, workers (\code{ORDER_READY}), alerting threads (\code{LOW_STOCK}) & \code{std::mutex send_mutex} per \code{ClientSession} + \code{send_all()} \\\hline
+\code{order->finalized} & Client disconnect handler and preparing worker & \code{std::atomic<bool>} via \code{exchange(true)} \\\hline
+\code{session->is_provider} & Client thread, order threads & \code{std::atomic<bool>} \\\hline
+\code{sessions_} list & Accept thread and disconnecting client threads & \code{std::mutex sessions_mutex_} \\\hline
+Standard output (\code{std::cout}) & All server threads & \code{std::mutex log_mutex_} \\\hline
+\end{tabularx}
+\end{table}
+
+\subsection{Step-by-step race condition on the last croissant}
+Suppose \code{stock_.croissant == 1} and Clients~A and~B simultaneously send \code{ORDER_REQUEST} for 1~croissant without \code{stock_mutex_}:
+\begin{enumerate}
+  \item Thread~A checks \code{stock_.croissant >= 1} (reads \code{1}, check passes).
+  \item Before Thread~A writes back, the OS preempts Thread~A and schedules Thread~B.
+  \item Thread~B checks \code{stock_.croissant >= 1} (still reads \code{1}, check passes).
+  \item Thread~B decrements \code{stock_.croissant} ($1 - 1 = 0$) and sends \code{ORDER_ACCEPTED} to Client~B.
+  \item Thread~A resumes, decrements \code{stock_.croissant} ($0 - 1 = -1$), and also sends \code{ORDER_ACCEPTED} to Client~A.
+\end{enumerate}
+Both clients were promised the same last croissant and inventory became invalid ($-1$). Holding \code{stock_mutex_} around the entire check-and-deduct block makes steps 1 and 4--5 mutually exclusive, so the second thread sees \code{0} and sends \code{ORDER_REFUSED}.
+
+\subsection{Concurrent worker send while client thread reads the same socket}
+TCP sockets are full-duplex, so reading (\code{recv}) on one thread while writing (\code{send}) on another thread is valid at the OS level, provided two rules are observed:
+\begin{enumerate}
+  \item \textbf{No concurrent writes from multiple threads:} A worker sending \code{ORDER_READY} can race with the client thread sending \code{MENU_RESPONSE} or a second worker sending \code{ORDER_READY} for another order. Without serialization, partial \code{send()} calls could interleave bytes from two JSON lines. Wrapping every \code{send_all()} in \code{session->send_mutex} guarantees atomic line transmission.
+  \item \textbf{Safe teardown and \code{SIGPIPE}:} If the client thread closes \code{fd} while a worker tries to send, the worker could trigger \code{SIGPIPE} (killing the process) or write to a newly recycled FD. Ignoring \code{SIGPIPE} / using \code{MSG_NOSIGNAL} and setting \code{send_closed = true; fd = -1;} inside \code{send_mutex} prevents both bugs.
+\end{enumerate}
+
+\subsection{Why one worker per CPU core vs.\ twice as many}
+The assignment specifies one worker per logical CPU core (\code{std::thread::hardware_concurrency()}, 12 on this machine) to cap concurrent preparation capacity and force excess orders to wait in the FIFO queue. Because our workers sleep via \code{condition_variable_any::}\allowbreak\code{wait_for}, doubling the worker count would not starve CPU cores, but it would double concurrent in-progress orders (reducing observable queueing under load), allocate extra thread stacks and scheduler state, and in real CPU-bound servers introduce context-switching and cache-thrashing overhead beyond core count without increasing hardware throughput.
+
+\section{Task 3: The provider}
+\subsection{How the server knows which connection is the provider}
+Every \code{ClientSession} starts with \code{is_provider = false}. When a connection sends \code{{"type":"PROVIDER_IDENTIFY"}}, \code{handle_provider_identify()} sets \code{session->is_provider = true} and stores a \code{std::shared_ptr<}\allowbreak\code{ClientSession>} in \code{active_provider_} under \code{provider_mutex_}. When \code{DELIVERY} arrives on any connection, \code{dispatch_line()} checks \code{session->is_provider.load()}; non-providers immediately receive \code{ERROR} with \code{ErrorCode::}\allowbreak\code{UNAUTHORIZED_OPERATION}.
+
+\subsection{Simultaneous delivery and order without losing updates}
+Both \code{handle_order_request()} and \code{handle_delivery()} mutate \code{stock_} exclusively inside a \code{std::lock_guard<}\allowbreak\code{std::mutex> lock{stock_mutex_}} critical section. Because mutex acquisition establishes a total order:
+\begin{itemize}
+  \item If the order acquires \code{stock_mutex_} first, it reads $S$, checks sufficiency, stores $S - q_{\text{order}}$, and releases the lock; the delivery then reads $S - q_{\text{order}}$ and stores $S - q_{\text{order}} + q_{\text{deliv}}$.
+  \item If the delivery acquires \code{stock_mutex_} first, it stores $S + q_{\text{deliv}}$; the order then reads $S + q_{\text{deliv}}$ and stores $S + q_{\text{deliv}} - q_{\text{order}}$.
+\end{itemize}
+In both schedules the final stock is identically $S + q_{\text{deliv}} - q_{\text{order}}$; neither thread can overwrite the other's read--modify--write update.
+
+\subsection{Which thread sends low-stock alerts and when}
+Two threads can send \code{LOW_STOCK}:
+\begin{enumerate}
+  \item \textbf{Immediately on order deduction:} The \emph{client-handling thread} executing \code{handle_order_request()} records any ordered product whose new stock fell below 5 while holding \code{stock_mutex_}, releases \code{stock_mutex_} (avoiding lock nesting), and immediately calls \code{notify_provider(alerts)} to push \code{LOW_STOCK} over \code{active_provider_->send_json(...)}.
+  \item \textbf{On late provider connection:} If no provider was connected when stock dropped below 5, the \emph{provider's connection thread} executes \code{handle_provider_identify()}, scans \code{stock_} under \code{stock_mutex_}, and sends \code{LOW_STOCK} for every product below 5.
+\end{enumerate}
+
+\section{Task 4: When things go wrong}
+\subsection{Detecting client disappearance: immediate vs.\ delayed}
+\begin{itemize}
+  \item \textbf{Detected immediately:} A clean close (\code{close()}/\code{exit}) sends TCP \code{FIN}, causing \code{poll()} to wake and \code{recv()} to return \code{0}. A killed local process (\code{SIGKILL}) has its sockets closed by the OS kernel immediately (sending \code{FIN} or \code{RST}), which also wakes \code{recv()} at once (\code{0} or \code{-1} with \code{ECONNRESET}).
+  \item \textbf{Not detected immediately:} A silent network drop (unplugged Ethernet cable, Wi-Fi loss, or powered-off peer with no active writes) sends neither \code{FIN} nor \code{RST}, leaving an idle \code{recv()} blocked indefinitely. Our server detects this via the application-level 3-second \code{HEARTBEAT_TIMEOUT}: \code{poll()} checks elapsed time since the last \code{HEARTBEAT}, and after 3\,seconds without a ping, closes the session cleanly.
+\end{itemize}
+
+\subsection{Stopping the worker and restoring stock}
+When \code{disconnect_session()} runs, it locks \code{session->orders_mutex}, sets \code{disconnected = true}, moves out all \code{active_orders}, and for each order calls \code{order->stop_source.request_stop()} followed by \code{order->finalized.exchange(true)}.
+\begin{itemize}
+  \item If the worker is mid-preparation inside \code{cv.wait_for(}\allowbreak\code{wait_lock, stop_tok, ...)}, calling \code{request_stop()} wakes the condition variable immediately; the worker observes \code{stop_tok.}\allowbreak\code{stop_requested()} and exits without sending \code{ORDER_READY}.
+  \item If the task is still queued in \code{ThreadSafeQueue}, when a worker pops it, the initial \code{if (stop_tok.}\allowbreak\code{stop_requested())} guard skips preparation in microseconds.
+  \item Whichever path flips \code{order->finalized} from \code{false} to \code{true} first (normally \code{disconnect_session()}, immediately on disconnect) adds the reserved quantities back to \code{stock_} under \code{stock_mutex_}; this atomic flag ensures stock is never restored twice and never lost.
+\end{itemize}
+
+\subsection{Why the client must receive and read the keyboard concurrently}
+In a coffee shop session, the server pushes asynchronous messages (\code{ORDER_READY}, \code{LOW_STOCK}, \code{ERROR}) at unpredictable times while the user sits at a blocking prompt typing commands or product amounts. If the client waited to read from the socket only after \code{stdin.readLine()}, notifications would sit unread in the kernel buffer until the user pressed Enter (and an idle provider might never read \code{LOW_STOCK}). In \code{lab2/client/Main.java}, the main thread handles \code{stdin} commands, a daemon thread runs \code{ServerListener} blocking on \code{in.readLine()} to display every server message immediately, and a \code{ScheduledExecutorService} sends \code{HEARTBEAT} every 1500\,ms.
+
+\chapter{Control Questions}
+
+\section{Listening socket vs.\ accepted sockets}
+The \textbf{listening socket} (created by \code{socket()}, bound with \code{bind()}, and placed in passive mode by \code{listen()}) only waits for and accepts incoming TCP handshake connections via \code{accept()}; it never sends or receives application payload data. Each call to \code{accept()} returns a new \textbf{connected socket} representing one specific client--server TCP stream used for \code{recv()} and \code{send()}. With 5~clients and 1~provider connected simultaneously, the server holds \textbf{1~listening socket} and \textbf{6~accepted sockets} (\textbf{7~socket file descriptors} in total).
+
+\section{Why one send is not one receive, and protocol framing}
+TCP is an unstructured byte stream, not a message-oriented datagram protocol. The kernel, Nagle's algorithm, socket buffers, and network MTU can merge two small \code{send()} calls into a single \code{recv()} buffer or split one large \code{send()} across multiple \code{recv()} calls. Our protocol frames every JSON message with a terminating \texttt{\textbackslash n} byte (avoiding literal unescaped newlines inside JSON strings). The server appends each \code{recv()} chunk to a per-session \code{line_buffer} and extracts complete messages strictly on \texttt{\textbackslash n} boundaries; outgoing messages append \texttt{\textbackslash n} and loop with \code{send_all()} until all bytes are transmitted.
+
+\section{Return value 0 vs.\ connection reset on recv}
+\begin{itemize}
+  \item \code{recv() == 0} indicates \textbf{EOF (orderly shutdown)}: the peer closed its write half cleanly by sending a TCP \code{FIN} packet and all preceding bytes have already been read.
+  \item \code{recv() < 0} with \code{errno == ECONNRESET} indicates an \textbf{abrupt reset}: the peer (or an intermediate host) sent a TCP \code{RST} segment---for example, because a process exited with unread data or crashed without a clean close. In both cases the server runs \code{disconnect_session()} to cancel unfinished orders and close the FD.
+\end{itemize}
+
+\section{Producer--consumer pattern in the server}
+The order preparation pipeline is a multi-producer, multi-consumer queue:
+\begin{itemize}
+  \item \textbf{Producers:} Each per-client \code{ClientSession} reader thread that accepts an \code{ORDER_REQUEST} and submits a \code{std::packaged_task<void()>} via \code{pool_.submitTask(...)}.
+  \item \textbf{Queue:} \code{ThreadSafeQueue<std::function<void()>>} (\code{m_queue} inside \code{ThreadPool}), synchronized by \code{m_mutex} and \code{m_cv}.
+  \item \textbf{Consumers:} The \code{hardware_concurrency()} worker \code{std::jthread}s inside \code{ThreadPool}, looping on \code{m_queue.wait_and_pop()} and preparing one order at a time.
+\end{itemize}
+
+\section{Cost of a waiting thread per client and scaling to 1000 clients}
+When a \code{ClientSession} thread waits in \code{poll()}/\code{recv()}, it sleeps in the kernel without burning CPU cycles, yet each thread still retains a dedicated user-space stack (typically 8\,MiB virtual reserve on Linux, with dirty stack pages consuming resident RAM), kernel thread descriptor (\code{task_struct}), and per-connection buffers. For a handful of clients this overhead is negligible. With 1000 concurrent clients, 1000 threads reserve roughly 8\,GiB of virtual stack space, consume tens of megabytes of resident stack/TLS memory, and increase scheduler context-switching overhead whenever bursts of messages arrive. At that scale, an event-driven I/O multiplexer such as \code{epoll} (or \code{io_uring}) managing non-blocking sockets on a small thread pool would replace 1000 blocking reader threads with a few event-loop threads.
+
+\section{Step-by-step race condition without locks}
+Beyond the last-croissant stock race in Section~4.2.2, consider \code{next_order_id_} or concurrent \code{send()} calls on the same connection.
+Suppose two worker threads finish Orders~\#1 and~\#2 for the same client at the same instant without \code{session->send_mutex}:
+\begin{enumerate}
+  \item Worker~1 enters \code{send_all()} with \lstinline|{"type":"ORDER_READY","orderId":1}\n| and writes the partial prefix \lstinline|{"type":"ORDER_| before preemption or socket buffer exhaustion.
+  \item Worker~2 enters \code{send_all()} and writes the complete line \lstinline|{"type":"ORDER_READY","orderId":2}\n|.
+  \item Worker~1 resumes and writes the remainder \lstinline|READY","orderId":1}\n|.
+\end{enumerate}
+The client's \code{readLine()} receives corrupted, unparseable JSON (\lstinline|{"type":"ORDER_{"type":"ORDER_READY","orderId":2}}|), losing Order~\#1's completion notice. Locking \code{session->send_mutex} around the full \code{send_all()} loop eliminates partial-write interleaving.
+
+\section{TCP connection identity and multiple local clients}
+One active TCP connection is uniquely identified by a 4-tuple (5-tuple including protocol):
+\[
+(\text{source IP},\ \text{source port},\ \text{destination IP},\ \text{destination port}).
+\]
+When five clients on the same machine (\code{127.0.0.1}) connect simultaneously to the server at \code{127.0.0.1:8000}, the operating system assigns each client socket a distinct \textbf{ephemeral source port} (for example, \code{51420}, \code{51422}, \code{51424}, \code{51426}, \code{51428}). Because the source port differs in each 4-tuple, the kernel demultiplexes all five streams to their five distinct accepted sockets without conflict.
+
+\utmconclusions
+The Coffee Shop server and client/provider pair implement all four laboratory tasks directly on top of raw TCP sockets, demonstrating how newline-delimited framing, bounded-scope mutexes, producer--consumer worker pools, cooperative \code{std::stop_token} cancellation, and application-level heartbeats combine to form a responsive and fault-tolerant concurrent network service.
+
+Key architectural takeaways from the implementation include:
+\begin{enumerate}
+  \item \textbf{Decoupling network I/O from preparation work:} Checking and deducting stock immediately while offloading preparation to a \code{ThreadPool} sized to \code{hardware_concurrency()} keeps clients responsive and prevents head-of-line blocking on long orders.
+  \item \textbf{Short, non-nested lock scopes prevent deadlocks and stalls:} Isolating \code{stock_mutex_}, \code{provider_mutex_}, \code{orders_mutex}, and per-session \code{send_mutex} ensures that slow socket writes never hold inventory locks and concurrent worker completions never corrupt outgoing JSON lines.
+  \item \textbf{Cooperative cancellation plus atomic finalization guarantees consistency:} Pairing \code{std::stop_source}/\code{std::stop_token} with \code{condition_variable_any::wait_for} and an atomic \code{finalized} flag wakes workers immediately on client disconnect or 3-second heartbeat timeout while restoring unfinished stock cleanly and exactly once.
+\end{enumerate}
+\end{document}
